@@ -12,23 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package restorer
+package types
 
 import (
+	"fmt"
 	"net/url"
+	"path"
 	"time"
 
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
-	"github.com/sirupsen/logrus"
+	flag "github.com/spf13/pflag"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/pkg/types"
-	"go.uber.org/zap"
 )
 
 const (
-	tmpDir                  = "/tmp"
-	tmpEventsDataFilePrefix = "etcd-restore-"
-
 	defaultName                     = "default"
 	defaultInitialAdvertisePeerURLs = "http://localhost:2380"
 	defaultInitialClusterToken      = "etcd-cluster"
@@ -39,13 +37,6 @@ const (
 	defaultEmbeddedEtcdQuotaBytes   = 8 * 1024 * 1024 * 1024 //8Gib
 )
 
-// Restorer is a struct for etcd data directory restorer
-type Restorer struct {
-	logger    *logrus.Entry
-	zapLogger *zap.Logger
-	store     snapstore.SnapStore
-}
-
 // RestoreOptions hold all snapshot restore related fields
 // Note: Please ensure DeepCopy and DeepCopyInto are properly implemented.
 type RestoreOptions struct {
@@ -53,7 +44,7 @@ type RestoreOptions struct {
 	ClusterURLs types.URLsMap
 	PeerURLs    types.URLs
 	// Base full snapshot + delta snapshots to restore from
-	BaseSnapshot  snapstore.Snapshot
+	BaseSnapshot  *snapstore.Snapshot
 	DeltaSnapList snapstore.SnapList
 }
 
@@ -73,24 +64,112 @@ type RestorationConfig struct {
 	EmbeddedEtcdQuotaBytes   int64    `json:"embeddedEtcdQuotaBytes,omitempty"`
 }
 
-type initIndex int
+// NewRestorationConfig returns the restoration config.
+func NewRestorationConfig() *RestorationConfig {
+	return &RestorationConfig{
+		InitialCluster:           initialClusterFromName(defaultName),
+		InitialClusterToken:      defaultInitialClusterToken,
+		RestoreDataDir:           fmt.Sprintf("%s.etcd", defaultName),
+		InitialAdvertisePeerURLs: []string{defaultInitialAdvertisePeerURLs},
+		Name:                     defaultName,
+		SkipHashCheck:            false,
+		MaxFetchers:              defaultMaxFetchers,
+		MaxCallSendMsgSize:       defaultMaxCallSendMsgSize,
+		MaxRequestBytes:          defaultMaxRequestBytes,
+		MaxTxnOps:                defaultMaxTxnOps,
+		EmbeddedEtcdQuotaBytes:   int64(defaultEmbeddedEtcdQuotaBytes),
+	}
+}
 
-func (i *initIndex) ConsistentIndex() uint64 {
+// AddFlags adds the flags to flagset.
+func (c *RestorationConfig) AddFlags(fs *flag.FlagSet) {
+	fs.StringVar(&c.InitialCluster, "initial-cluster", c.InitialCluster, "initial cluster configuration for restore bootstrap")
+	fs.StringVar(&c.InitialClusterToken, "initial-cluster-token", c.InitialClusterToken, "initial cluster token for the etcd cluster during restore bootstrap")
+	fs.StringVarP(&c.RestoreDataDir, "data-dir", "d", c.RestoreDataDir, "path to the data directory")
+	fs.StringArrayVar(&c.InitialAdvertisePeerURLs, "initial-advertise-peer-urls", c.InitialAdvertisePeerURLs, "list of this member's peer URLs to advertise to the rest of the cluster")
+	fs.StringVar(&c.Name, "name", c.Name, "human-readable name for this member")
+	fs.BoolVar(&c.SkipHashCheck, "skip-hash-check", c.SkipHashCheck, "ignore snapshot integrity hash value (required if copied from data directory)")
+	fs.UintVar(&c.MaxFetchers, "max-fetchers", c.MaxFetchers, "maximum number of threads that will fetch delta snapshots in parallel")
+	fs.IntVar(&c.MaxCallSendMsgSize, "max-call-send-message-size", c.MaxCallSendMsgSize, "maximum size of message that the client sends")
+	fs.UintVar(&c.MaxRequestBytes, "max-request-bytes", c.MaxRequestBytes, "Maximum client request size in bytes the server will accept")
+	fs.UintVar(&c.MaxTxnOps, "max-txn-ops", c.MaxTxnOps, "Maximum number of operations permitted in a transaction")
+	fs.Int64Var(&c.EmbeddedEtcdQuotaBytes, "embedded-etcd-quota-bytes", c.EmbeddedEtcdQuotaBytes, "maximum backend quota for the embedded etcd used for applying delta snapshots")
+}
+
+// Validate validates the config.
+func (c *RestorationConfig) Validate() error {
+	if _, err := types.NewURLsMap(c.InitialCluster); err != nil {
+		return fmt.Errorf("failed creating url map for restore cluster: %v", err)
+	}
+	if _, err := types.NewURLs(c.InitialAdvertisePeerURLs); err != nil {
+		return fmt.Errorf("failed parsing peers urls for restore cluster: %v", err)
+	}
+	if c.MaxCallSendMsgSize <= 0 {
+		return fmt.Errorf("max call send message should be greater than zero")
+	}
+	if c.MaxFetchers <= 0 {
+		return fmt.Errorf("max fetchers should be greater than zero")
+	}
+	if c.EmbeddedEtcdQuotaBytes <= 0 {
+		return fmt.Errorf("Etcd Quota size for etcd must be greater than 0")
+	}
+	c.RestoreDataDir = path.Clean(c.RestoreDataDir)
+	return nil
+}
+
+// DeepCopyInto copies the structure deeply from in to out.
+func (c *RestorationConfig) DeepCopyInto(out *RestorationConfig) {
+	*out = *c
+	if c.InitialAdvertisePeerURLs != nil {
+		c, out := &c.InitialAdvertisePeerURLs, &out.InitialAdvertisePeerURLs
+		*out = make([]string, len(*c))
+		for i, v := range *c {
+			(*out)[i] = v
+		}
+	}
+}
+
+// DeepCopy returns a deeply copied structure.
+func (c *RestorationConfig) DeepCopy() *RestorationConfig {
+	if c == nil {
+		return nil
+	}
+
+	out := new(RestorationConfig)
+	c.DeepCopyInto(out)
+	return out
+}
+
+func initialClusterFromName(name string) string {
+	n := name
+	if name == "" {
+		n = defaultName
+	}
+	return fmt.Sprintf("%s=http://localhost:2380", n)
+}
+
+// InitIndex stores the index
+type InitIndex int
+
+// ConsistentIndex gets the index
+func (i *InitIndex) ConsistentIndex() uint64 {
 	return uint64(*i)
 }
 
-// event is wrapper over etcd event to keep track of time of event
-type event struct {
+// Event is wrapper over etcd event to keep track of time of event
+type Event struct {
 	EtcdEvent *clientv3.Event `json:"etcdEvent"`
 	Time      time.Time       `json:"time"`
 }
 
-type fetcherInfo struct {
+// FetcherInfo stores the information about fetcher
+type FetcherInfo struct {
 	Snapshot  snapstore.Snapshot
 	SnapIndex int
 }
 
-type applierInfo struct {
+// ApplierInfo stores the info about applier
+type ApplierInfo struct {
 	EventsFilePath string
 	SnapIndex      int
 }
@@ -160,29 +239,6 @@ func (in *RestoreOptions) DeepCopy() *RestoreOptions {
 	}
 
 	out := new(RestoreOptions)
-	in.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyInto copies the structure deeply from in to out.
-func (in *RestorationConfig) DeepCopyInto(out *RestorationConfig) {
-	*out = *in
-	if in.InitialAdvertisePeerURLs != nil {
-		in, out := &in.InitialAdvertisePeerURLs, &out.InitialAdvertisePeerURLs
-		*out = make([]string, len(*in))
-		for i, v := range *in {
-			(*out)[i] = v
-		}
-	}
-}
-
-// DeepCopy returns a deeply copied structure.
-func (in *RestorationConfig) DeepCopy() *RestorationConfig {
-	if in == nil {
-		return nil
-	}
-
-	out := new(RestorationConfig)
 	in.DeepCopyInto(out)
 	return out
 }
